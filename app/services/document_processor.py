@@ -18,12 +18,14 @@ from docling_core.types.doc import PictureItem
 
 from app.config import settings
 from app.services.s3_service import S3Service
+from app.services.dynamodb_service import DynamoDBService
 
 logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
     def __init__(self):
         self.s3_service = S3Service()
+        self.dynamodb_service = DynamoDBService()
         self.executor = ThreadPoolExecutor()
         
         # Initialize document converter with your options
@@ -42,14 +44,29 @@ class DocumentProcessor:
             },
         )
 
-    async def process_document(self, file_path: str, output_prefix: str = None) -> Tuple[str, str]:
-        """Process a document and return paths to generated markdown and JSON files"""
+    async def process_document(
+        self, 
+        document_id: str,
+        knowledge_base_id: str,
+        user_id: str,
+        file_path: str, 
+        output_prefix: str = None
+    ) -> Tuple[str, str]:
+        """Process a document and update status in DynamoDB"""
         
         # Create unique processing directory
         processing_dir = Path(settings.PROCESSING_DIR) / str(uuid.uuid4())
         processing_dir.mkdir(parents=True, exist_ok=True)
         
         try:
+            # Update initial status
+            await self.dynamodb_service.update_parsing_status(
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+                status="PROCESSING"
+            )
+            
             # Download file from S3
             input_file = processing_dir / Path(file_path).name
             self.s3_service.download_file(file_path, input_file)
@@ -71,12 +88,36 @@ class DocumentProcessor:
                 output_prefix
             )
             
+            # Update success status
+            await self.dynamodb_service.update_parsing_status(
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+                status="COMPLETED",
+                markdown_path=md_path,
+                json_path=json_path
+            )
+            
             return md_path, json_path
             
+        except Exception as e:
+            # Update error status
+            await self.dynamodb_service.update_parsing_status(
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+                status="FAILED",
+                error_message=str(e)
+            )
+            raise
         finally:
-            # Cleanup
-            if processing_dir.exists():
-                shutil.rmtree(processing_dir)
+            # Ensure cleanup happens in all cases
+            try:
+                if processing_dir.exists():
+                    shutil.rmtree(processing_dir)
+                    print(f"Cleaned up directory: {processing_dir}")
+            except Exception as cleanup_error:
+                print(f"Error during cleanup: {cleanup_error}")
 
     def _convert_document(self, input_file: Path) -> list[ConversionResult]:
         """Convert document using Docling"""
