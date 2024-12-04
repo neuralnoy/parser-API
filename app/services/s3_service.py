@@ -13,7 +13,13 @@ class S3Service:
         )
         self.bucket = settings.S3_BUCKET
 
-    def download_file(self, s3_key: str, local_path: Path) -> None:
+    def download_file(self, s3_key: str, local_path: Path | str) -> None:
+        """Download file from S3 to local path"""
+        # Convert string to Path if needed
+        if isinstance(local_path, str):
+            local_path = Path(local_path)
+        
+        # Create parent directories if they don't exist
         local_path.parent.mkdir(parents=True, exist_ok=True)
         self.s3_client.download_file(self.bucket, s3_key, str(local_path))
 

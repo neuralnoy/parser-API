@@ -65,6 +65,6 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=8001,
         timeout_keep_alive=3600,  # 1 hour
-        workers=1,  # Number of worker processes
+        workers=2,  # Number of worker processes
         timeout_graceful_shutdown=300,  # 5 minutes grace period for shutdown
     )

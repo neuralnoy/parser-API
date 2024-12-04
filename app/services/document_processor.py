@@ -8,6 +8,7 @@ from typing import Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
+import os
 
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
@@ -28,7 +29,7 @@ class DocumentProcessor:
         self.dynamodb_service = DynamoDBService()
         self.executor = ThreadPoolExecutor()
         
-        # Initialize document converter with your options
+        # Initialize document converter with options
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = True
         pipeline_options.do_table_structure = True
@@ -99,8 +100,9 @@ class DocumentProcessor:
             )
             
             return md_path, json_path
-            
+
         except Exception as e:
+            logger.error(f"Error processing document: {str(e)}", exc_info=True)
             # Update error status
             await self.dynamodb_service.update_parsing_status(
                 document_id=document_id,
@@ -110,14 +112,40 @@ class DocumentProcessor:
                 error_message=str(e)
             )
             raise
+
         finally:
+            # Add a small delay to ensure all file handles are closed
+            await asyncio.sleep(0.5)
+            
             # Ensure cleanup happens in all cases
-            try:
-                if processing_dir.exists():
-                    shutil.rmtree(processing_dir)
-                    print(f"Cleaned up directory: {processing_dir}")
-            except Exception as cleanup_error:
-                print(f"Error during cleanup: {cleanup_error}")
+            if processing_dir.exists():
+                try:
+                    # Walk directory tree bottom-up and remove everything
+                    for root, dirs, files in os.walk(processing_dir, topdown=False):
+                        root_path = Path(root)
+                        
+                        # Remove all files in current directory
+                        for name in files:
+                            file_path = root_path / name
+                            try:
+                                file_path.unlink()
+                            except Exception as e:
+                                logger.warning(f"Failed to remove file {file_path}: {e}")
+                        
+                        # Remove all subdirectories
+                        for name in dirs:
+                            dir_path = root_path / name
+                            try:
+                                dir_path.rmdir()
+                            except Exception as e:
+                                logger.warning(f"Failed to remove directory {dir_path}: {e}")
+                    
+                    # Finally remove the root processing directory
+                    processing_dir.rmdir()
+                    logger.info(f"Cleaned up directory: {processing_dir}")
+                    
+                except Exception as cleanup_error:
+                    logger.error(f"Error during cleanup: {cleanup_error}", exc_info=True)
 
     def _convert_document(self, input_file: Path) -> list[ConversionResult]:
         """Convert document using Docling"""
@@ -148,92 +176,108 @@ class DocumentProcessor:
                 
             doc_filename = conv_res.input.file.stem
             
-            # Export and process JSON
-            json_file = output_dir / f"{doc_filename}.json"
-            with json_file.open("w") as fp:
-                json_data = conv_res.document.export_to_dict()
-                json.dump(json_data, fp)
-            
-            # Get markdown content
-            markdown_content = conv_res.document.export_to_markdown()
-            
-            # Process images and update content
-            picture_counter = 0
-            descriptions = []
-            for element, _level in conv_res.document.iterate_items():
-                if isinstance(element, PictureItem):
-                    picture_counter += 1
-                    image_file = output_dir / f"{doc_filename}-picture-{picture_counter}.png"
-                    
-                    # Save image
-                    with image_file.open("wb") as fp:
-                        element.get_image(conv_res.document).save(fp, "PNG")
-                    
-                    # Get AI description
-                    description = self._get_image_description(image_file)
-                    descriptions.append((element.self_ref, description))
-                    
-                    # Update markdown
-                    markdown_content = markdown_content.replace(
-                        "<!-- image -->",
-                        f"![Image {picture_counter}]({s3_prefix}/{doc_filename}-picture-{picture_counter}.png)\n\n**AI Description**: {description}\n",
-                        1
-                    )
-            
-            # Update JSON with descriptions
-            for picture_ref, description in descriptions:
-                for picture in json_data.get("pictures", []):
-                    if picture["self_ref"] == picture_ref:
-                        picture["annotations"].append(description)
-                        break
-            
-            # Save updated JSON
-            with json_file.open("w") as fp:
-                json.dump(json_data, fp, indent=4)
-            
-            # Save markdown
-            md_file = output_dir / f"{doc_filename}.md"
-            with md_file.open("w") as fp:
-                fp.write(markdown_content)
-            
-            # Upload files to S3
-            s3_md_path = f"{s3_prefix}/{doc_filename}.md"
-            s3_json_path = f"{s3_prefix}/{doc_filename}.json"
-            
-            self.s3_service.upload_file(md_file, s3_md_path)
-            self.s3_service.upload_file(json_file, s3_json_path)
-            
-            md_path = s3_md_path
-            json_path = s3_json_path
+            try:
+                # Export and process JSON
+                json_file = output_dir / f"{doc_filename}.json"
+                with json_file.open("w") as fp:
+                    json_data = conv_res.document.export_to_dict()
+                    json.dump(json_data, fp)
+                
+                # Get markdown content
+                markdown_content = conv_res.document.export_to_markdown()
+                
+                # Process images and update content
+                picture_counter = 0
+                descriptions = []
+                
+                for element, _level in conv_res.document.iterate_items():
+                    if isinstance(element, PictureItem):
+                        picture_counter += 1
+                        image_file = output_dir / f"{doc_filename}-picture-{picture_counter}.png"
+                        
+                        # Save image
+                        with image_file.open("wb") as fp:
+                            element.get_image(conv_res.document).save(fp, "PNG")
+                        
+                        # Get AI description
+                        description = self._get_image_description(image_file)
+                        descriptions.append((element.self_ref, description))
+                        
+                        # Update markdown
+                        markdown_content = markdown_content.replace(
+                            "<!-- image -->",
+                            f"![Image {picture_counter}]({s3_prefix}/{doc_filename}-picture-{picture_counter}.png)\n\n**AI Description**: {description}\n",
+                            1
+                        )
+                
+                # Update JSON with descriptions
+                if "pictures" in json_data:
+                    for picture_ref, description in descriptions:
+                        for picture in json_data["pictures"]:
+                            if picture["self_ref"] == picture_ref:
+                                if "annotations" not in picture:
+                                    picture["annotations"] = []
+                                picture["annotations"].append({
+                                    "type": "ai_description",
+                                    "content": description
+                                })
+                                break
+
+                # Save JSON and markdown files
+                with json_file.open("w") as fp:
+                    json.dump(json_data, fp, indent=2)
+                
+                md_file = output_dir / f"{doc_filename}.md"
+                with md_file.open("w") as fp:
+                    fp.write(markdown_content)
+                
+                # Upload files to S3
+                s3_md_path = f"{s3_prefix}/{doc_filename}.md"
+                s3_json_path = f"{s3_prefix}/{doc_filename}.json"
+                
+                self.s3_service.upload_file(md_file, s3_md_path)
+                self.s3_service.upload_file(json_file, s3_json_path)
+                
+                md_path = s3_md_path
+                json_path = s3_json_path
+                
+            except Exception as e:
+                logger.error(f"Error processing document {doc_filename}: {str(e)}", exc_info=True)
+                raise
         
         return md_path, json_path
 
     def _get_image_description(self, image_path: Path) -> str:
         """Get AI description for image"""
-        base64_image = self._encode_image(image_path)
-        
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "What is in this image?",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}"
+        try:
+            base64_image = self._encode_image(image_path)
+            
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "This is not a conversation. Describe this image in great detail. If you can't see anything, say 'No visible content'."
                             },
-                        },
-                    ],
-                }
-            ],
-        )
-        return response.choices[0].message.content
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=1000,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error getting image description: {str(e)}", exc_info=True)
+            return "Image description unavailable"
 
     def _encode_image(self, image_path: Path) -> str:
         """Encode image to base64"""
