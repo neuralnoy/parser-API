@@ -14,6 +14,7 @@ class DynamoDBService:
         )
         self.table = self.dynamodb.Table('parsed_documents')
         self.executor = ThreadPoolExecutor()
+        self.token_usage_table = self.dynamodb.Table('parser_token_usage')
 
     def _update_status(self, item: dict):
         """Synchronous method to update DynamoDB"""
@@ -50,3 +51,33 @@ class DynamoDBService:
             self._update_status,
             item
         ) 
+
+    async def record_document_token_usage(
+        self,
+        document_id: str,
+        knowledge_base_id: str,
+        user_id: str,
+        file_name: str,
+        input_tokens: dict,
+        output_tokens: dict,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        number_of_images: int
+    ):
+        item = {
+            'id': user_id,
+            'document_id': document_id,
+            'knowledge_base_id': knowledge_base_id,
+            'file_name': file_name,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_input_tokens': total_input_tokens,
+            'total_output_tokens': total_output_tokens,
+            'number_of_images': number_of_images,
+            'processed_at': datetime.utcnow().isoformat()
+        }
+
+        await asyncio.get_event_loop().run_in_executor(
+            self.executor,
+            lambda: self.token_usage_table.put_item(Item=item)
+        )

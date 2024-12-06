@@ -20,6 +20,7 @@ from docling_core.types.doc import PictureItem
 from app.config import settings
 from app.services.s3_service import S3Service
 from app.services.dynamodb_service import DynamoDBService
+from app.services.token_counter_service import TokenCounterService
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class DocumentProcessor:
         self.s3_service = S3Service()
         self.dynamodb_service = DynamoDBService()
         self.executor = ThreadPoolExecutor()
+        self.token_counter = TokenCounterService()
         
         # Initialize document converter with options
         pipeline_options = PdfPipelineOptions()
@@ -44,6 +46,19 @@ class DocumentProcessor:
                 InputFormat.DOCX: WordFormatOption(pipeline_cls=SimplePipeline),
             },
         )
+
+        # Add to existing initialization
+        self.token_usage = {
+            'input_tokens': {
+                'image_description': 0,
+                'other_operations': 0  # Add more operations as needed
+            },
+            'output_tokens': {
+                'image_description': 0,
+                'other_operations': 0  # Add more operations as needed
+            }
+        }
+        self.number_of_images = 0
 
     async def process_document(
         self, 
@@ -89,6 +104,35 @@ class DocumentProcessor:
                 output_prefix
             )
             
+            # Before returning, record token usage
+            total_input_tokens = sum(self.token_usage['input_tokens'].values())
+            total_output_tokens = sum(self.token_usage['output_tokens'].values())
+
+            await self.dynamodb_service.record_document_token_usage(
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+                file_name=Path(file_path).name,
+                input_tokens=self.token_usage['input_tokens'],
+                output_tokens=self.token_usage['output_tokens'],
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                number_of_images=self.number_of_images
+            )
+
+            # Reset token tracking for next document
+            self.token_usage = {
+                'input_tokens': {
+                    'image_description': 0,
+                    'other_operations': 0
+                },
+                'output_tokens': {
+                    'image_description': 0,
+                    'other_operations': 0
+                }
+            }
+            self.number_of_images = 0
+
             # Update success status
             await self.dynamodb_service.update_parsing_status(
                 document_id=document_id,
@@ -251,30 +295,48 @@ class DocumentProcessor:
         """Get AI description for image"""
         try:
             base64_image = self._encode_image(image_path)
+            prompt = "This is not a conversation. Describe this image in great detail. Be very specific. Be very accurate. If you can't see anything, say 'No visible content'."
             
+            # Construct the complete messages block
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}",
+                                "detail": "low"
+                            },
+                        },
+                    ],
+                }
+            ]
+            
+            # Count and track tokens by operation (add 500 for safety)
+            input_tokens = self.token_counter.count_tokens(prompt) + 500
+            self.token_usage['input_tokens']['image_description'] += input_tokens
+
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "This is not a conversation. Describe this image in great detail. If you can't see anything, say 'No visible content'."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}"
-                                },
-                            },
-                        ],
-                    }
-                ],
+                messages=messages,
                 max_tokens=1000,
             )
-            return response.choices[0].message.content
+
+            description = response.choices[0].message.content
+            output_tokens = self.token_counter.count_tokens(description)
+            self.token_usage['output_tokens']['image_description'] += output_tokens
+            self.number_of_images += 1
+
+            logger.info(f"Token usage - Input: {input_tokens}, Output: {output_tokens}")
+
+            return description
+            
         except Exception as e:
             logger.error(f"Error getting image description: {str(e)}", exc_info=True)
             return "Image description unavailable"

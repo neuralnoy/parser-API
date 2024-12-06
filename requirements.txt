@@ -2,4 +2,5 @@ fastapi
 uvicorn
 python-multipart
 openai
-docling 
+docling
+tiktoken 
