@@ -3,22 +3,42 @@ from app.models.schemas import DocumentProcessRequest, ProcessingResponse
 from app.services.document_processor import DocumentProcessor
 from app.config import settings
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import multiprocessing
+import psutil
+import logging
 
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def create_app():
+    app = FastAPI(
+        title=settings.PROJECT_NAME,
+        version=settings.VERSION,
+    )
+    
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    return app
 
-document_processor = DocumentProcessor()
+app = create_app()
+
+try:
+    document_processor = DocumentProcessor()
+except Exception as e:
+    logger.error(f"Failed to initialize DocumentProcessor: {str(e)}", exc_info=True)
+    raise RuntimeError(f"Service initialization failed: {str(e)}")
 
 @app.post(
     f"{settings.API_V1_STR}/process",
@@ -27,7 +47,9 @@ document_processor = DocumentProcessor()
 )
 async def process_document(request: DocumentProcessRequest):
     try:
-        # Start processing and wait for results
+        # Add logging at the start
+        logger.info(f"Starting document processing for document_id: {request.document_id}")
+        
         md_path, json_path = await document_processor.process_document(
             document_id=request.document_id,
             knowledge_base_id=request.knowledge_base_id,
@@ -36,7 +58,6 @@ async def process_document(request: DocumentProcessRequest):
             output_prefix=request.output_prefix
         )
         
-        # Return the actual results
         return ProcessingResponse(
             status="success",
             message="Document processed successfully",
@@ -46,25 +67,54 @@ async def process_document(request: DocumentProcessRequest):
         )
         
     except Exception as e:
-        await document_processor.dynamodb_service.update_parsing_status(
-            document_id=request.document_id,
-            knowledge_base_id=request.knowledge_base_id,
-            user_id=request.user_id,
-            status="FAILED",
-            error_message=str(e)
-        )
+        logger.error(f"Error processing document: {str(e)}", exc_info=True)
+        
+        # Ensure DynamoDB status is updated even if there's an error
+        try:
+            await document_processor.dynamodb_service.update_parsing_status(
+                document_id=request.document_id,
+                knowledge_base_id=request.knowledge_base_id,
+                user_id=request.user_id,
+                status="FAILED",
+                error_message=str(e)
+            )
+        except Exception as db_error:
+            logger.error(f"Failed to update DynamoDB status: {str(db_error)}")
+            
+        # Re-raise with more context
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing document: {str(e)}"
+            detail={
+                "message": "Error processing document",
+                "error": str(e),
+                "document_id": request.document_id
+            }
         )
 
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "memory_usage": psutil.Process().memory_info().rss / 1024 / 1024  # MB
+    }
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
+    # Calculate optimal number of workers based on CPU cores
+    workers = multiprocessing.cpu_count()
+    
+    config = uvicorn.Config(
+        app="main:app",
+        host="0.0.0.0",
         port=8000,
+        workers=workers,
         timeout_keep_alive=1800,  # 30 minutes
-        workers=1,  # Number of worker processes
-        timeout_graceful_shutdown=600,  # 10 minutes grace period for shutdown
+        timeout_graceful_shutdown=600,  # 10 minutes
+        reload=False,
+        loop="uvloop",
+        limit_concurrency=50,  # Limit concurrent connections
+        limit_max_requests=1000,  # Restart worker after N requests
+        timeout_notify=30,  # How long to wait for worker to start/stop
     )
+    
+    server = uvicorn.Server(config)
+    server.run()

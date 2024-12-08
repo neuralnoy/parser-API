@@ -9,6 +9,10 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 import os
+import resource
+import gc
+import psutil
+from fastapi import HTTPException
 
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
@@ -59,6 +63,7 @@ class DocumentProcessor:
             }
         }
         self.number_of_images = 0
+        self.process = psutil.Process(os.getpid())
 
     async def process_document(
         self, 
@@ -70,126 +75,155 @@ class DocumentProcessor:
     ) -> Tuple[str, str]:
         """Process a document and update status in DynamoDB"""
         
-        # Create unique processing directory
-        processing_dir = Path(settings.PROCESSING_DIR) / str(uuid.uuid4())
-        processing_dir.mkdir(parents=True, exist_ok=True)
-        
         try:
-            # Update initial status
-            await self.dynamodb_service.update_parsing_status(
-                document_id=document_id,
-                knowledge_base_id=knowledge_base_id,
-                user_id=user_id,
-                status="PROCESSING"
-            )
+            # Get current limits
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
             
-            # Download file from S3
-            input_file = processing_dir / Path(file_path).name
-            self.s3_service.download_file(file_path, input_file)
+            # Try to set a reasonable limit based on system memory
+            total_memory = psutil.virtual_memory().total
+            desired_limit = min(total_memory, 1024 * 1024 * 1024)  # Use 1GB or system total, whichever is smaller
             
-            # Process document in thread pool to not block event loop
-            conv_results = await asyncio.get_event_loop().run_in_executor(
-                self.executor,
-                self._convert_document,
-                input_file
-            )
+            try:
+                # Only set the limit if it's lower than current
+                if desired_limit < soft or soft == -1:
+                    resource.setrlimit(resource.RLIMIT_AS, (desired_limit, hard))
+                    logger.info(f"Set memory limit to {desired_limit / (1024*1024):.2f} MB")
+            except ValueError as e:
+                logger.warning(f"Could not set memory limit: {e}. Continuing with system defaults.")
             
-            # Export and upload results
-            md_path, json_path = await asyncio.get_event_loop().run_in_executor(
-                self.executor,
-                self._export_and_upload_results,
-                conv_results,
-                processing_dir,
-                file_path,
-                output_prefix
-            )
+            # Clear memory before processing
+            gc.collect()
             
-            # Before returning, record token usage
-            total_input_tokens = sum(self.token_usage['input_tokens'].values())
-            total_output_tokens = sum(self.token_usage['output_tokens'].values())
+            # Create unique processing directory
+            processing_dir = Path(settings.PROCESSING_DIR) / str(uuid.uuid4())
+            processing_dir.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                # Update initial status
+                await self.dynamodb_service.update_parsing_status(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                    status="PROCESSING"
+                )
+                
+                # Download file from S3
+                input_file = processing_dir / Path(file_path).name
+                self.s3_service.download_file(file_path, input_file)
+                
+                # Process document in thread pool to not block event loop
+                conv_results = await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    self._convert_document,
+                    input_file
+                )
+                
+                # Export and upload results
+                md_path, json_path = await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    self._export_and_upload_results,
+                    conv_results,
+                    processing_dir,
+                    file_path,
+                    output_prefix
+                )
+                
+                # Before returning, record token usage
+                total_input_tokens = sum(self.token_usage['input_tokens'].values())
+                total_output_tokens = sum(self.token_usage['output_tokens'].values())
 
-            await self.dynamodb_service.record_document_token_usage(
-                document_id=document_id,
-                knowledge_base_id=knowledge_base_id,
-                user_id=user_id,
-                file_name=Path(file_path).name,
-                input_tokens=self.token_usage['input_tokens'],
-                output_tokens=self.token_usage['output_tokens'],
-                total_input_tokens=total_input_tokens,
-                total_output_tokens=total_output_tokens,
-                number_of_images=self.number_of_images
-            )
+                await self.dynamodb_service.record_document_token_usage(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                    file_name=Path(file_path).name,
+                    input_tokens=self.token_usage['input_tokens'],
+                    output_tokens=self.token_usage['output_tokens'],
+                    total_input_tokens=total_input_tokens,
+                    total_output_tokens=total_output_tokens,
+                    number_of_images=self.number_of_images
+                )
 
-            # Reset token tracking for next document
-            self.token_usage = {
-                'input_tokens': {
-                    'image_description': 0,
-                    'other_operations': 0
-                },
-                'output_tokens': {
-                    'image_description': 0,
-                    'other_operations': 0
+                # Reset token tracking for next document
+                self.token_usage = {
+                    'input_tokens': {
+                        'image_description': 0,
+                        'other_operations': 0
+                    },
+                    'output_tokens': {
+                        'image_description': 0,
+                        'other_operations': 0
+                    }
                 }
-            }
-            self.number_of_images = 0
+                self.number_of_images = 0
 
-            # Update success status
-            await self.dynamodb_service.update_parsing_status(
-                document_id=document_id,
-                knowledge_base_id=knowledge_base_id,
-                user_id=user_id,
-                status="COMPLETED",
-                markdown_path=md_path,
-                json_path=json_path
+                # Update success status
+                await self.dynamodb_service.update_parsing_status(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                    status="COMPLETED",
+                    markdown_path=md_path,
+                    json_path=json_path
+                )
+                
+                return md_path, json_path
+
+            except Exception as e:
+                logger.error(f"Error processing document: {str(e)}", exc_info=True)
+                # Update error status
+                await self.dynamodb_service.update_parsing_status(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                    status="FAILED",
+                    error_message=str(e)
+                )
+                raise
+
+            finally:
+                # Add a small delay to ensure all file handles are closed
+                await asyncio.sleep(0.5)
+                
+                # Ensure cleanup happens in all cases
+                if processing_dir.exists():
+                    try:
+                        # Walk directory tree bottom-up and remove everything
+                        for root, dirs, files in os.walk(processing_dir, topdown=False):
+                            root_path = Path(root)
+                            
+                            # Remove all files in current directory
+                            for name in files:
+                                file_path = root_path / name
+                                try:
+                                    file_path.unlink()
+                                except Exception as e:
+                                    logger.warning(f"Failed to remove file {file_path}: {e}")
+                            
+                            # Remove all subdirectories
+                            for name in dirs:
+                                dir_path = root_path / name
+                                try:
+                                    dir_path.rmdir()
+                                except Exception as e:
+                                    logger.warning(f"Failed to remove directory {dir_path}: {e}")
+                        
+                        # Finally remove the root processing directory
+                        processing_dir.rmdir()
+                        logger.info(f"Cleaned up directory: {processing_dir}")
+                        
+                    except Exception as cleanup_error:
+                        logger.error(f"Error during cleanup: {cleanup_error}", exc_info=True)
+
+        except MemoryError:
+            self._emergency_cleanup()
+            raise HTTPException(
+                status_code=503,
+                detail="Server is temporarily unable to process this document due to resource constraints"
             )
-            
-            return md_path, json_path
-
         except Exception as e:
-            logger.error(f"Error processing document: {str(e)}", exc_info=True)
-            # Update error status
-            await self.dynamodb_service.update_parsing_status(
-                document_id=document_id,
-                knowledge_base_id=knowledge_base_id,
-                user_id=user_id,
-                status="FAILED",
-                error_message=str(e)
-            )
+            self._emergency_cleanup()
             raise
-
-        finally:
-            # Add a small delay to ensure all file handles are closed
-            await asyncio.sleep(0.5)
-            
-            # Ensure cleanup happens in all cases
-            if processing_dir.exists():
-                try:
-                    # Walk directory tree bottom-up and remove everything
-                    for root, dirs, files in os.walk(processing_dir, topdown=False):
-                        root_path = Path(root)
-                        
-                        # Remove all files in current directory
-                        for name in files:
-                            file_path = root_path / name
-                            try:
-                                file_path.unlink()
-                            except Exception as e:
-                                logger.warning(f"Failed to remove file {file_path}: {e}")
-                        
-                        # Remove all subdirectories
-                        for name in dirs:
-                            dir_path = root_path / name
-                            try:
-                                dir_path.rmdir()
-                            except Exception as e:
-                                logger.warning(f"Failed to remove directory {dir_path}: {e}")
-                    
-                    # Finally remove the root processing directory
-                    processing_dir.rmdir()
-                    logger.info(f"Cleaned up directory: {processing_dir}")
-                    
-                except Exception as cleanup_error:
-                    logger.error(f"Error during cleanup: {cleanup_error}", exc_info=True)
 
     def _convert_document(self, input_file: Path) -> list[ConversionResult]:
         """Convert document using Docling"""
@@ -317,8 +351,8 @@ class DocumentProcessor:
                 }
             ]
             
-            # Count and track tokens by operation (add 500 for safety)
-            input_tokens = self.token_counter.count_tokens(prompt) + 500
+            # Count and track tokens by operation
+            input_tokens = self.token_counter.count_tokens(str(messages))
             self.token_usage['input_tokens']['image_description'] += input_tokens
 
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -345,3 +379,16 @@ class DocumentProcessor:
         """Encode image to base64"""
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
+
+    def _emergency_cleanup(self):
+        """Emergency cleanup when things go wrong"""
+        try:
+            gc.collect()
+            self.process.memory_info()
+            
+            # Reset document converter
+            self.doc_converter = None
+            self.__init__()  # Reinitialize the processor
+            
+        except Exception as e:
+            logger.error(f"Emergency cleanup failed: {str(e)}", exc_info=True)
