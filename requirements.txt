@@ -1,6 +1,7 @@
 fastapi
+boto3
 uvicorn
 python-multipart
 openai
 docling
-tiktoken 
+tiktoken

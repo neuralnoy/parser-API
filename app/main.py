@@ -63,8 +63,8 @@ if __name__ == "__main__":
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=8001,
-        timeout_keep_alive=3600,  # 1 hour
+        port=8000,
+        timeout_keep_alive=1800,  # 30 minutes
         workers=1,  # Number of worker processes
-        timeout_graceful_shutdown=300,  # 5 minutes grace period for shutdown
+        timeout_graceful_shutdown=600,  # 10 minutes grace period for shutdown
     )
