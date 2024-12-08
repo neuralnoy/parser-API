@@ -351,8 +351,11 @@ class DocumentProcessor:
                 }
             ]
             
-            # Count and track tokens by operation
-            input_tokens = self.token_counter.count_tokens(str(messages))
+            # Count only the prompt tokens
+            input_tokens = self.token_counter.count_tokens(prompt)
+            # Add 200 tokens for the image
+            input_tokens += 200
+
             self.token_usage['input_tokens']['image_description'] += input_tokens
 
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
