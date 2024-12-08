@@ -259,7 +259,9 @@ class DocumentProcessor:
                 json_file = output_dir / f"{doc_filename}.json"
                 with json_file.open("w") as fp:
                     json_data = conv_res.document.export_to_dict()
-                    json.dump(json_data, fp)
+                    # Clean base64 data before saving
+                    cleaned_json_data = self._clean_base64_from_json(json_data.copy())
+                    json.dump(cleaned_json_data, fp, indent=2)
                 
                 # Get markdown content
                 markdown_content = conv_res.document.export_to_markdown()
@@ -395,3 +397,17 @@ class DocumentProcessor:
             
         except Exception as e:
             logger.error(f"Emergency cleanup failed: {str(e)}", exc_info=True)
+
+    def _clean_base64_from_json(self, json_data: dict) -> dict:
+        """Remove base64 representations from JSON data while preserving image metadata"""
+        if isinstance(json_data, dict):
+            for key, value in json_data.items():
+                if key == "uri" and isinstance(value, str) and value.startswith('data:image/'):
+                    json_data[key] = '[IMAGE DATA REMOVED]'
+                elif isinstance(value, (dict, list)):
+                    self._clean_base64_from_json(value)
+        elif isinstance(json_data, list):
+            for item in json_data:
+                if isinstance(item, (dict, list)):
+                    self._clean_base64_from_json(item)
+        return json_data
