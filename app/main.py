@@ -107,12 +107,12 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         workers=workers,
-        timeout_keep_alive=1800,  # 30 minutes
+        timeout_keep_alive=2700,  # 45 minutes
         timeout_graceful_shutdown=600,  # 10 minutes
         reload=False,
         loop="uvloop",
         limit_concurrency=50,  # Limit concurrent connections
-        limit_max_requests=1000,  # Restart worker after N requests
+        limit_max_requests=1500,  # Restart worker after N requests
         timeout_notify=30,  # How long to wait for worker to start/stop
     )
     
