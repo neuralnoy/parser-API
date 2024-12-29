@@ -25,6 +25,7 @@ from app.config import settings
 from app.services.s3_service import S3Service
 from app.services.dynamodb_service import DynamoDBService
 from app.services.token_counter_service import TokenCounterService
+from app.services.vector_store_service import VectorStoreService, vector_store_service
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class DocumentProcessor:
         self.dynamodb_service = DynamoDBService()
         self.executor = ThreadPoolExecutor()
         self.token_counter = TokenCounterService()
+        self.vector_store_service = vector_store_service
         
         # Initialize document converter with options
         pipeline_options = PdfPipelineOptions()
@@ -119,12 +121,13 @@ class DocumentProcessor:
                 )
                 
                 # Export and upload results
-                md_path, json_path = await asyncio.get_event_loop().run_in_executor(
-                    self.executor,
-                    self._export_and_upload_results,
+                md_path, json_path = await self._export_and_upload_results(
                     conv_results,
                     processing_dir,
                     file_path,
+                    document_id,
+                    user_id,
+                    knowledge_base_id,
                     output_prefix
                 )
                 
@@ -232,11 +235,14 @@ class DocumentProcessor:
             raises_on_error=False,
         ))
 
-    def _export_and_upload_results(
+    async def _export_and_upload_results(
         self,
         conv_results: list[ConversionResult],
         processing_dir: Path,
         input_path: str,
+        document_id: str,
+        user_id: str,
+        knowledge_base_id: str,
         output_prefix: str = None
     ) -> Tuple[str, str]:
         """Export results and upload to S3"""
@@ -246,6 +252,7 @@ class DocumentProcessor:
         s3_prefix = self.s3_service.get_output_prefix(input_path, output_prefix)
         md_path = None
         json_path = None
+        local_md_file = None
         
         for conv_res in conv_results:
             if conv_res.status != ConversionStatus.SUCCESS:
@@ -311,6 +318,8 @@ class DocumentProcessor:
                 with md_file.open("w") as fp:
                     fp.write(markdown_content)
                 
+                local_md_file = md_file  # Store the local markdown file path
+                
                 # Upload files to S3
                 s3_md_path = f"{s3_prefix}/{doc_filename}.md"
                 s3_json_path = f"{s3_prefix}/{doc_filename}.json"
@@ -320,6 +329,18 @@ class DocumentProcessor:
                 
                 md_path = s3_md_path
                 json_path = s3_json_path
+                
+                # Process markdown for vector storage
+                try:
+                    await self.vector_store_service.process_markdown(
+                        markdown_path=local_md_file,  # Use the stored local file path
+                        document_id=document_id,
+                        user_id=user_id,
+                        knowledge_base_id=knowledge_base_id
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing markdown for vector storage: {str(e)}")
+                    # Don't raise the error - we still want to return the processed files
                 
             except Exception as e:
                 logger.error(f"Error processing document {doc_filename}: {str(e)}", exc_info=True)

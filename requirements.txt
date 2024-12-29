@@ -6,3 +6,8 @@ openai
 docling
 tiktoken
 psutil
+langchain-community
+langchain-openai
+pymilvus
+unstructured
+markdown

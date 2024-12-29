@@ -3,6 +3,10 @@ from datetime import datetime
 import asyncio
 from app.config import settings
 from concurrent.futures import ThreadPoolExecutor
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DynamoDBService:
     def __init__(self):
@@ -15,6 +19,8 @@ class DynamoDBService:
         self.table = self.dynamodb.Table('parsed_documents')
         self.executor = ThreadPoolExecutor()
         self.token_usage_table = self.dynamodb.Table('parser_token_usage')
+        self.embedding_tokens_table = self.dynamodb.Table(settings.DYNAMODB_EMBEDDING_TOKENS_TABLE)
+        self.loop = asyncio.get_event_loop()
 
     def _update_status(self, item: dict):
         """Synchronous method to update DynamoDB"""
@@ -81,3 +87,36 @@ class DynamoDBService:
             self.executor,
             lambda: self.token_usage_table.put_item(Item=item)
         )
+
+    async def record_embedding_token_usage(
+        self,
+        document_id: str,
+        knowledge_base_id: str,
+        user_id: str,
+        total_tokens: int,
+        chunk_count: int,
+        file_name: str
+    ) -> None:
+        """Record embedding token usage in DynamoDB"""
+        try:
+            item = {
+                'user_id': user_id,
+                'document_id': document_id,
+                'knowledge_base_id': knowledge_base_id,
+                'file_name': file_name,
+                'total_tokens': total_tokens,
+                'chunk_count': chunk_count,
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            
+            await self.loop.run_in_executor(
+                self.executor,
+                lambda: self.embedding_tokens_table.put_item(Item=item)
+            )
+            
+            logger.info(f"Recorded embedding token usage for document {document_id}")
+            
+        except Exception as e:
+            logger.error(f"Error recording embedding token usage: {str(e)}")
+            raise

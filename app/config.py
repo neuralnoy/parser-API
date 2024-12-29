@@ -19,5 +19,12 @@ class Settings:
     
     # Local processing
     PROCESSING_DIR = os.getenv("PROCESSING_DIR", "processing")
+    
+    # Zilliz Cloud
+    ZILLIZ_CLOUD_URI = os.getenv("ZILLIZ_CLOUD_URI")
+    ZILLIZ_CLOUD_API_KEY = os.getenv("ZILLIZ_CLOUD_API_KEY")
+    
+    # Add to Settings class
+    DYNAMODB_EMBEDDING_TOKENS_TABLE = os.getenv("DYNAMODB_EMBEDDING_TOKENS_TABLE", "embedding_tokens")
 
 settings = Settings()
