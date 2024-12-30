@@ -70,7 +70,8 @@ class VectorStoreService:
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=1536),
             FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=255),
-            FieldSchema(name="knowledge_base_id", dtype=DataType.VARCHAR, max_length=255)
+            FieldSchema(name="knowledge_base_id", dtype=DataType.VARCHAR, max_length=255),
+            FieldSchema(name="document_name", dtype=DataType.VARCHAR, max_length=255)
         ]
         
         schema = CollectionSchema(
@@ -145,6 +146,9 @@ class VectorStoreService:
             metadatas = [doc.metadata for doc in docs]
             embeddings_list = self.embeddings.embed_documents(texts)
 
+            # Get the original document name from the markdown path
+            document_name = markdown_path.stem.replace('-processed', '')
+
             # Create entities
             entities = []
             for text, vector, metadata in zip(texts, embeddings_list, metadatas):
@@ -152,7 +156,8 @@ class VectorStoreService:
                     "text": text,
                     "vector": vector,
                     "document_id": document_id,
-                    "knowledge_base_id": knowledge_base_id
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_name": document_name
                 })
 
             # Insert data
