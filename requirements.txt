@@ -11,3 +11,5 @@ langchain-openai
 pymilvus
 unstructured
 markdown
+python-dotenv
+httpx
