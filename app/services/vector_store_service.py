@@ -9,8 +9,10 @@ from pymilvus import (
     DataType, 
     connections, 
     utility, 
-    Collection
+    Collection,
+    MilvusException
 )
+import time
 from ..config import settings
 from pathlib import Path
 from app.services.token_counter_service import TokenCounterService
@@ -23,28 +25,56 @@ class VectorStoreService:
         self.embeddings = OpenAIEmbeddings(api_key=settings.OPENAI_API_KEY)
         self.token_counter = TokenCounterService()
         self.dynamodb_service = DynamoDBService()
+        self.max_retries = 3
+        self.retry_delay = 2  # Initial delay in seconds
+        self.connected = False
         self.connect_to_milvus()
 
     def connect_to_milvus(self):
-        """Establish connection to Milvus"""
-        try:
-            # First check if connection exists and disconnect if it does
+        """Establish connection to Milvus with retry logic"""
+        retries = 0
+        while retries < self.max_retries:
             try:
-                connections.disconnect("default")
-            except:
-                pass
+                # First check if connection exists and disconnect if it does
+                try:
+                    connections.disconnect("default")
+                except:
+                    pass
                 
-            # Create new connection
-            connections.connect(
-                alias="default",
-                uri=settings.ZILLIZ_CLOUD_URI,
-                token=settings.ZILLIZ_CLOUD_API_KEY,
-                secure=True
-            )
-            logger.info("Successfully connected to Milvus")
-        except Exception as e:
-            logger.error(f"Failed to connect to Milvus: {str(e)}")
-            raise
+                # Create new connection
+                connections.connect(
+                    alias="default",
+                    uri=settings.ZILLIZ_CLOUD_URI,
+                    token=settings.ZILLIZ_CLOUD_API_KEY,
+                    secure=True
+                )
+                logger.info("Successfully connected to Milvus")
+                self.connected = True
+                return
+            except MilvusException as e:
+                retries += 1
+                wait_time = self.retry_delay * (2 ** (retries - 1))  # Exponential backoff
+                logger.warning(f"Failed to connect to Milvus (attempt {retries}/{self.max_retries}): {str(e)}")
+                logger.info(f"Waiting {wait_time} seconds before retrying...")
+                time.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Unexpected error connecting to Milvus: {str(e)}")
+                raise
+
+        logger.error("Failed to connect to Milvus after maximum retries")
+        self.connected = False
+
+    def ensure_connection(self):
+        """Ensure Milvus connection is active"""
+        if not self.connected:
+            self.connect_to_milvus()
+        else:
+            try:
+                # Test connection by listing collections
+                utility.list_collections()
+            except Exception:
+                logger.info("Connection lost, attempting to reconnect...")
+                self.connect_to_milvus()
 
     def get_collection_name(self, user_id: str, knowledge_base_id: str) -> str:
         """Generate unique collection name for user"""
@@ -112,11 +142,10 @@ class VectorStoreService:
             logger.info(f"Starting vector processing for document {document_id}")
             
             # Ensure connection is established
-            try:
-                utility.list_collections()
-            except Exception as e:
-                logger.info("Reconnecting to Milvus...")
-                self.connect_to_milvus()
+            self.ensure_connection()
+            if not self.connected:
+                logger.error("Cannot process document: Unable to establish Milvus connection")
+                return  # Return without raising to prevent complete service failure
             
             # Load and process the markdown directly from local path
             loader = UnstructuredMarkdownLoader(str(markdown_path))
@@ -131,10 +160,14 @@ class VectorStoreService:
             collection_name = self.get_collection_name(user_id, knowledge_base_id)
 
             # Create collection if it doesn't exist
-            if not utility.has_collection(collection_name):
-                collection = self.create_collection(collection_name)
-            else:
-                collection = Collection(name=collection_name)
+            try:
+                if not utility.has_collection(collection_name):
+                    collection = self.create_collection(collection_name)
+                else:
+                    collection = Collection(name=collection_name)
+            except MilvusException as e:
+                logger.error(f"Milvus collection error: {str(e)}")
+                return  # Return without raising to prevent complete service failure
 
             # Prepare data
             texts = [doc.page_content for doc in docs]
