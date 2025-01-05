@@ -52,20 +52,22 @@ class DocumentProcessor:
                 InputFormat.DOCX: WordFormatOption(pipeline_cls=SimplePipeline),
             },
         )
-
-        # Add to existing initialization
-        self.token_usage = {
-            'input_tokens': {
-                'image_description': 0,
-                'other_operations': 0  # Add more operations as needed
-            },
-            'output_tokens': {
-                'image_description': 0,
-                'other_operations': 0  # Add more operations as needed
-            }
-        }
-        self.number_of_images = 0
         self.process = psutil.Process(os.getpid())
+
+    def _create_token_usage_tracker(self):
+        return {
+            'token_usage': {
+                'input_tokens': {
+                    'image_description': 0,
+                    'other_operations': 0
+                },
+                'output_tokens': {
+                    'image_description': 0,
+                    'other_operations': 0
+                }
+            },
+            'number_of_images': 0
+        }
 
     async def process_document(
         self, 
@@ -76,6 +78,9 @@ class DocumentProcessor:
         output_prefix: str = None
     ) -> Tuple[str, str]:
         """Process a document and update status in DynamoDB"""
+        
+        # Create a new token usage tracker for this document
+        usage_tracker = self._create_token_usage_tracker()
         
         try:
             # Get current limits
@@ -128,37 +133,25 @@ class DocumentProcessor:
                     document_id,
                     user_id,
                     knowledge_base_id,
-                    output_prefix
+                    output_prefix,
+                    usage_tracker  # Pass the usage tracker
                 )
                 
                 # Before returning, record token usage
-                total_input_tokens = sum(self.token_usage['input_tokens'].values())
-                total_output_tokens = sum(self.token_usage['output_tokens'].values())
+                total_input_tokens = sum(usage_tracker['token_usage']['input_tokens'].values())
+                total_output_tokens = sum(usage_tracker['token_usage']['output_tokens'].values())
 
                 await self.dynamodb_service.record_document_token_usage(
                     document_id=document_id,
                     knowledge_base_id=knowledge_base_id,
                     user_id=user_id,
                     file_name=Path(file_path).name,
-                    input_tokens=self.token_usage['input_tokens'],
-                    output_tokens=self.token_usage['output_tokens'],
+                    input_tokens=usage_tracker['token_usage']['input_tokens'],
+                    output_tokens=usage_tracker['token_usage']['output_tokens'],
                     total_input_tokens=total_input_tokens,
                     total_output_tokens=total_output_tokens,
-                    number_of_images=self.number_of_images
+                    number_of_images=usage_tracker['number_of_images']
                 )
-
-                # Reset token tracking for next document
-                self.token_usage = {
-                    'input_tokens': {
-                        'image_description': 0,
-                        'other_operations': 0
-                    },
-                    'output_tokens': {
-                        'image_description': 0,
-                        'other_operations': 0
-                    }
-                }
-                self.number_of_images = 0
 
                 # Update success status
                 await self.dynamodb_service.update_parsing_status(
@@ -243,7 +236,8 @@ class DocumentProcessor:
         document_id: str,
         user_id: str,
         knowledge_base_id: str,
-        output_prefix: str = None
+        output_prefix: str = None,
+        usage_tracker: dict = None
     ) -> Tuple[str, str]:
         """Export results and upload to S3"""
         output_dir = processing_dir / "output"
@@ -287,7 +281,7 @@ class DocumentProcessor:
                             element.get_image(conv_res.document).save(fp, "PNG")
                         
                         # Get AI description
-                        description = self._get_image_description(image_file)
+                        description = await self._get_image_description(image_file, usage_tracker)
                         descriptions.append((element.self_ref, description))
                         
                         # Update markdown
@@ -348,7 +342,7 @@ class DocumentProcessor:
         
         return md_path, json_path
 
-    def _get_image_description(self, image_path: Path) -> str:
+    async def _get_image_description(self, image_path: Path, usage_tracker: dict) -> str:
         """Get AI description for image"""
         try:
             base64_image = self._encode_image(image_path)
@@ -379,7 +373,7 @@ class DocumentProcessor:
             # Add 200 tokens for the image
             input_tokens += 200
 
-            self.token_usage['input_tokens']['image_description'] += input_tokens
+            usage_tracker['token_usage']['input_tokens']['image_description'] += input_tokens
 
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
             response = client.chat.completions.create(
@@ -390,8 +384,8 @@ class DocumentProcessor:
 
             description = response.choices[0].message.content
             output_tokens = self.token_counter.count_tokens(description)
-            self.token_usage['output_tokens']['image_description'] += output_tokens
-            self.number_of_images += 1
+            usage_tracker['token_usage']['output_tokens']['image_description'] += output_tokens
+            usage_tracker['number_of_images'] += 1
 
             logger.info(f"Token usage - Input: {input_tokens}, Output: {output_tokens}")
 
